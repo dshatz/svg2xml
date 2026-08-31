@@ -1,0 +1,151 @@
+name: Build
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request_target:
+    branches:
+      - main
+      - develop
+  release:
+    types: [created]
+
+
+jobs:
+  build:
+    name: Build on ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86_64)
+            os: ubuntu-latest
+            artifact_name: svg2xml-linux-x86_64
+            asset_path: build/svg2xml
+
+          - name: Linux (arm64)
+            os: ubuntu-latest
+            artifact_name: svg2xml-linux-arm64
+            asset_path: build-arm64/svg2xml
+
+          - name: macOS (Apple Silicon & Intel)
+            os: macos-latest
+            artifact_name: svg2xml-macos-universal
+            asset_path: build/svg2xml
+
+          - name: Windows (x64)
+            os: windows-latest
+            artifact_name: svg2xml-windows-x64.exe
+            asset_path: build/Release/svg2xml.exe
+
+          - name: WebAssembly (WASM)
+            os: ubuntu-latest
+            is_wasm: true
+            artifact_name: svg2xml-wasm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies (Linux)
+        if: runner.os == 'Linux' && matrix.is_wasm != true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtinyxml2-dev nanosvg-dev gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tinyxml2 nanosvg
+
+      - name: Install Dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install tinyxml2:x64-windows nanosvg:x64-windows
+
+      - name: Setup Emscripten (WASM)
+        if: matrix.is_wasm == true
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.53
+
+      - name: Configure CMake (Linux / macOS)
+        if: runner.os != 'Windows' && matrix.is_wasm != true
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Configure CMake (WASM)
+        if: matrix.is_wasm == true
+        run: |
+          sudo apt-get update && sudo apt-get install -y libtinyxml2-dev nanosvg-dev
+          emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Binary
+        run: cmake --build build --config Release
+
+      - name: Build Linux Arm
+        if: matrix.name == 'Linux (arm64)'
+        run: |
+            cmake -B build-arm64 \
+                -DCMAKE_SYSTEM_NAME=Linux \
+                -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+                -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+            cmake --build build-arm64
+
+      - name: Prepare WASM Artifacts
+        if: matrix.is_wasm == true
+        run: |
+          mkdir -p build/wasm_dist
+          cp build/svg2xml.js build/wasm_dist/
+          cp build/svg2xml.wasm build/wasm_dist/
+
+      - name: Upload Native Artifact
+        if: matrix.is_wasm != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.asset_path }}
+
+      - name: Upload WASM Artifact
+        if: matrix.is_wasm == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: build/wasm_dist/
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package Assets
+        run: |
+          mkdir dist
+          cp artifacts/svg2xml-linux-x86_64/svg2xml dist/svg2xml-linux-x86_64
+          cp artifacts/svg2xml-linux-arm64/svg2xml dist/svg2xml-linux-arm64
+          cp artifacts/svg2xml-macos-universal/svg2xml dist/svg2xml-macos-universal
+          cp artifacts/svg2xml-windows-x64.exe/svg2xml.exe dist/svg2xml-windows-x64.exe
+
+          cd artifacts/svg2xml-wasm
+          zip -r ../../dist/svg2xml-wasm.zip .
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
